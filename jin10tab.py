@@ -76,7 +76,7 @@ class Jin10App:
     def update_news(self):
         # 获取新闻数据
         news_data = self.get_jin10_data2()
-        print(f"\n资讯直播： {news_data[0]}\n")
+        # print(f"\n资讯直播： {news_data[0]}\n")
         # 逆序处理，以确保最旧的新闻在底部
         for item in reversed(news_data):
             news_id = item["id"]

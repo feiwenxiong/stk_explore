@@ -9,7 +9,16 @@ import numpy as np
 from datetime import datetime
 import instock.core.tablestructure as tbs
 import akshare as ak
-# import akshare as ak
+import sys
+import os
+# 添加项目路径到sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from instock.lib.akshare_patch import patch_akshare_session, patch_akshare_direct
+
+# 应用akshare补丁
+patch_akshare_session()
+patch_akshare_direct()
+
 def getTodayStock(save=True) -> pd.DataFrame:
     '''
     获取股吧人气榜等数据
@@ -42,11 +51,17 @@ def earn_money_xiaoying():
             11      统计日期  2024-04-15 15:00:00
     '''
     import akshare as ak
-    stock_market_activity_legu_df = ak.stock_market_activity_legu()
-    # print(stock_market_activity_legu_df) 
-    stock_market_activity_legu_df.index = stock_market_activity_legu_df["item"]
-    stock_market_activity_legu_df.drop("item",axis=1,inplace=True)
-    return stock_market_activity_legu_df.T
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        stock_market_activity_legu_df = ak.stock_market_activity_legu()
+        stock_market_activity_legu_df.index = stock_market_activity_legu_df["item"]
+        stock_market_activity_legu_df.drop("item", axis=1, inplace=True)
+        return stock_market_activity_legu_df.T
+    except Exception as e:
+        logger.warning(f"获取赚钱效应数据失败 (legulegu.com 可能改版): {e}")
+        # 返回空 DataFrame，让调用方优雅降级
+        return pd.DataFrame()
 
 def kongpan_attention():
     '''筛选关注文件中的股票的最近的控盘率走势
@@ -62,12 +77,30 @@ def kongpan_attention():
     
     trend = []
     for code in ATTENTION:
-        stock_comment_detail_zlkp_jgcyd_em_df = ak.stock_comment_detail_zlkp_jgcyd_em(symbol=code)
-        trend.append([round(x,2) for x in stock_comment_detail_zlkp_jgcyd_em_df["value"].tolist()])
+        try:
+            stock_comment_detail_zlkp_jgcyd_em_df = ak.stock_comment_detail_zlkp_jgcyd_em(symbol=code)
+            # 检查数据框中是否存在'value'列，如果不存在则尝试其他可能的列名
+            if 'value' in stock_comment_detail_zlkp_jgcyd_em_df.columns:
+                trend.append([round(x,2) for x in stock_comment_detail_zlkp_jgcyd_em_df["value"].tolist()])
+            elif 'Value' in stock_comment_detail_zlkp_jgcyd_em_df.columns:
+                trend.append([round(x,2) for x in stock_comment_detail_zlkp_jgcyd_em_df["Value"].tolist()])
+            elif len(stock_comment_detail_zlkp_jgcyd_em_df.columns) > 1:
+                # 如果没有明确的'value'列，使用第二列（通常是数值列）
+                value_column = stock_comment_detail_zlkp_jgcyd_em_df.columns[1]
+                trend.append([round(x,2) for x in stock_comment_detail_zlkp_jgcyd_em_df[value_column].tolist()])
+            else:
+                # 如果数据框为空或只有1列，添加空列表
+                trend.append([])
+        except Exception as e:
+            print(f"获取股票 {code} 的控盘数据时出错: {e}")
+            # 出错时添加空列表
+            trend.append([])
     
     data["近来控盘比例趋势"] = trend
-    # data["近来控盘比例趋势"].apply(lambda x:round(x,2))
-    data = pd.merge(data,spot_df,left_on="代码",right_on="代码",how="left")
+    
+    # 只有在spot_df不为None时才进行合并
+    if spot_df is not None:
+        data = pd.merge(data,spot_df,left_on="代码",right_on="代码",how="left")
     # data.drop("")
     # print(data)
     # data[""]
@@ -97,36 +130,7 @@ if __name__ == "__main__":
     df_dict["飙升榜"] = stock_hot_up_em_df
     
     #千人千评
-    # stock_comment_em_df = ak.stock_comment_em()
-    # print(stock_comment_em_df)
-        #抱团
-    # df_dict = {}
-    import akshare as ak
-    stock_lh_yyb_control_df = ak.stock_lh_yyb_control()
-    print(stock_lh_yyb_control_df)
-    df_dict["抱团营业部"] = stock_lh_yyb_control_df
-    
-    
-    
-    
-    data = kongpan_attention()
-    print(data)
-    stock_selection_df = getTodayStock(save=False)
-    data = pd.merge(data[["代码","近来控盘比例趋势"]],
-                    stock_selection_df,
-                    left_on="代码",
-                    right_on="代码",
-                    how="left")
-    df_dict["主力控盘-关注"] = data
-    
-    # from utils import add_charts
-    # add_charts(data)
-    
-    #
-    from utils import merge_df_files
-    merge_df_files(df_dict,"市场热点+个人关注控盘")
-
-    
-   
-    
-    
+    stock_comment_em_df = ak.stock_comment_em()
+    print(stock_comment_em_df)
+    # data = kongpan_attention()
+    # print(data)

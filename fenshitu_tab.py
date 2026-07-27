@@ -7,6 +7,7 @@ import json
 import requests
 import logging
 import io
+import random
 import pandas as pd
 import ttkbootstrap as ttk
 # import ttkinter as ttk
@@ -25,7 +26,16 @@ from utils import is_now_break,is_now_open
 import akshare as ak
 import concurrent.futures
 import threading
-import akshare as ak
+import sys
+import os
+# 添加项目路径到sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from instock.lib.http_client import get_session, update_ua
+
+# 注意：akshare patch 由 ggui.py 统一管理，此处不再重复调用
+# from instock.lib.akshare_patch import patch_akshare_session, patch_akshare_direct
+
+
 def _get_market_code(stock_code):
     """
     根据股票代码计算出市场代码。
@@ -35,10 +45,13 @@ def _get_market_code(stock_code):
     # 获取股票代码的前缀
     code_prefix = int(stock_code[0])
 
-    # 根据前缀判断市场[更新20240919]
-    if code_prefix in [0, 2, 3,4,8]:  # 深圳股票代码前缀一般为 0、2、3
+    # 根据前缀���断市场[更新20240919]
+    if code_prefix in [0, 2, 3, 4]:  # 深圳股票代码前缀一般为 0、2、3
         return 0  # 深圳市场
     elif code_prefix in [6, 9]:  # 上海股票代码前缀一般为 6、9
+        # 920xxx 是北交所，在东方财富API中用市场码0
+        if len(stock_code) >= 3 and stock_code[:3] == "920":
+            return 0
         return 1  # 上海市场
     else:
         return 2  # 其他市场，此处假设为北京市场
@@ -85,22 +98,32 @@ def get_minutely_data(code: str,bankuai=False,dapan=-1) -> dict:
     else:
         pass
 
-    # print(url)
-    headers = {
-        "Accept": "text/event-stream"
-    }
+    # 使用统一配置的HTTP客户端
+    session = get_session()
+    
+    # 更新User-Agent以避免反爬虫
+    update_ua(session)
 
-    response = requests.get(url, headers=headers, stream=True)  # 请求数据，开启流式传输
+    try:
+        response = session.get(url, stream=True, timeout=10)  # 请求数据，开启流式传输
 
-    if response.status_code == 200:
-        event_data = ""
-        for chunk in response.iter_content(chunk_size=None):  # 不断地获取数据
-            data_decoded = chunk.decode('utf-8')  # 将字节流解码成字符串
-            event_data += data_decoded
-            parts = event_data.split('\n\n')
-            if len(parts) > 1:  # 获取到一条完整的事件后，对数据进行解析。
-                data = _handle_event(parts[0])
-                return json.loads(data)
+        if response.status_code == 200:
+            event_data = ""
+            for chunk in response.iter_content(chunk_size=None):  # 不断地获取数据
+                data_decoded = chunk.decode('utf-8')  # 将字节流解码成字符串
+                event_data += data_decoded
+                parts = event_data.split('\n\n')
+                if len(parts) > 1:  # 获取到一条完整的事件后，对数据进行解析。
+                    data = _handle_event(parts[0])
+                    result = json.loads(data)
+                    if "data" not in result or result["data"] is None:
+                        raise ValueError(f"SSE返回空数据: code={code}")
+                    return result
+        else:
+            raise ConnectionError(f"HTTP {response.status_code}: code={code}")
+    except Exception as e:
+        logging.warning(f"[get_minutely_data] 获取分时数据失败 (code={code}): {e}")
+        return None
 
 
 
@@ -212,7 +235,7 @@ def get_bankuai_dapan_minute_trend2(show=False):
             #获取1min分时数据
             data_test_ = data_to_data_frame(get_minutely_data(stock_code,bankuai=False))
             #scale
-            tmp_vol = data_test_["Volumn"]
+            tmp_vol = data_test_["Volume"]
             data_test_ = (data_test_ / data_test_.iloc[0] - 1.0) * 100
             fluid_shares = ak.stock_individual_info_em(symbol=stock_code)["流通股"]
             fluid_shares = tmp_vol / fluid_shares * 100
@@ -242,33 +265,86 @@ def get_bankuai_dapan_minute_trend2(show=False):
 # from collections import OrderedDict
 
 def get_bankuai_data(bankuai_name, bankuai_code,bankuai_rank):
-    data_test = data_to_data_frame(get_minutely_data(bankuai_code, bankuai=True))
+    raw = get_minutely_data(bankuai_code, bankuai=True)
+    if raw is None:
+        logging.warning(f"[get_bankuai_data] 获取板块分时数据失败: {bankuai_name}")
+        return bankuai_name, pd.DataFrame(), bankuai_rank
+    data_test = data_to_data_frame(raw)
+    if data_test is None or data_test.empty:
+        return bankuai_name, pd.DataFrame(), bankuai_rank
     data_test = (data_test / data_test.iloc[0] - 1.0) * 100
     return bankuai_name, data_test,bankuai_rank
 
 def get_bankuai_stock_data(stock_name, stock_code, stock_rank):
+    """获取个股分时数据，附带计算换手率"""
     tmp = get_minutely_data(stock_code, bankuai=False)
-    # print(stock_code)
+    if tmp is None:
+        logging.debug(f"股票 {stock_name}({stock_code}) 分时数据为空")
+        return stock_name, pd.DataFrame(), stock_rank, None
+    
     data_test_ = data_to_data_frame(tmp)
-    # print(data_test_)
-    if data_test_ is not None:
+    if data_test_ is not None and not data_test_.empty:
         data_test_ = (data_test_ / data_test_.iloc[0] - 1.0) * 100
     else:
-        print(stock_name, stock_code, stock_rank)
-        data_test_ = pd.DataFrame()
-    return stock_name, data_test_, stock_rank
+        return stock_name, pd.DataFrame(), stock_rank, None
+    
+    # 后台线程预计算换手率（失败不影响主数据）
+    turnover = None
+    if "Volume" in data_test_.columns:
+        try:
+            import akshare as ak
+            info = ak.stock_individual_info_em(symbol=stock_code)
+            if len(info) > 7:
+                fluid_shares = info.iloc[7]["value"]
+                tmp_vol = data_test_["Volume"]
+                turnover = tmp_vol * 100 / fluid_shares * 100
+            else:
+                # 尝试其他行获取流通股
+                for idx, row in info.iterrows():
+                    if "流通股" in str(row.iloc[0]) or "流通" in str(row.iloc[0]):
+                        fluid_shares = row.iloc[1]
+                        tmp_vol = data_test_["Volume"]
+                        turnover = tmp_vol * 100 / fluid_shares * 100
+                        break
+        except Exception as e:
+            logging.debug(f"股票 {stock_name}({stock_code}) 换手率获取失败(不影响主图): {e}")
+    
+    return stock_name, data_test_, stock_rank, turnover
+
+def _akshare_retry(func, *args, max_retries=3, **kwargs):
+    """akshare 调用重试包装，处理连接中断"""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                delay = (2 ** attempt) + random.uniform(0.5, 1.5)
+                logging.warning(f"[{func.__name__}] 重试 {attempt+1}/{max_retries}: {e}, 等待{delay:.1f}s")
+                time.sleep(delay)
+            else:
+                logging.error(f"[{func.__name__}] 最终失败 (重试{max_retries}次): {e}")
+                raise
+
 
 def get_bankuai_dapan_minute_trend(show=False):
     import time
     s = time.time()
-    shanghai_index_df = data_to_data_frame(get_minutely_data("0", bankuai=False, dapan=0))
-    shanghai_index_df = (shanghai_index_df / shanghai_index_df.iloc[0] - 1.0) * 100
-    sz_index_df = data_to_data_frame(get_minutely_data("0", bankuai=False, dapan=1))
-    sz_index_df = (sz_index_df / sz_index_df.iloc[0] - 1.0) * 100
-    chuangye_index_df = data_to_data_frame(get_minutely_data("0", bankuai=False, dapan=2))
-    chuangye_index_df = (chuangye_index_df / chuangye_index_df.iloc[0] - 1.0) * 100
+    shanghai_raw = get_minutely_data("0", bankuai=False, dapan=0)
+    sz_raw = get_minutely_data("0", bankuai=False, dapan=1)
+    chuangye_raw = get_minutely_data("0", bankuai=False, dapan=2)
 
-    stock_board_industry_name_em_df = ak.stock_board_industry_name_em()
+    shanghai_index_df = data_to_data_frame(shanghai_raw) if shanghai_raw else pd.DataFrame()
+    sz_index_df = data_to_data_frame(sz_raw) if sz_raw else pd.DataFrame()
+    chuangye_index_df = data_to_data_frame(chuangye_raw) if chuangye_raw else pd.DataFrame()
+
+    if not shanghai_index_df.empty:
+        shanghai_index_df = (shanghai_index_df / shanghai_index_df.iloc[0] - 1.0) * 100
+    if not sz_index_df.empty:
+        sz_index_df = (sz_index_df / sz_index_df.iloc[0] - 1.0) * 100
+    if not chuangye_index_df.empty:
+        chuangye_index_df = (chuangye_index_df / chuangye_index_df.iloc[0] - 1.0) * 100
+
+    stock_board_industry_name_em_df = _akshare_retry(ak.stock_board_industry_name_em)
     stock_board_industry_name_em_df_5 = stock_board_industry_name_em_df.head(6)[["排名", "板块名称", "板块代码"]]
 
     outer = OrderedDict()
@@ -290,7 +366,13 @@ def get_bankuai_dapan_minute_trend(show=False):
             outer[bankuai_name] = [bankuai_rank,bankuai_data]
 
             # Fetch stocks for each bankuai
-            stock_board_industry_cons_em_df = ak.stock_board_industry_cons_em(symbol=bankuai_name).head(8)
+            try:
+                stock_board_industry_cons_em_df = _akshare_retry(
+                    ak.stock_board_industry_cons_em, symbol=bankuai_name
+                ).head(8)
+            except Exception as e:
+                logging.warning(f"[板块成分股] {bankuai_name} 获取失败: {e}")
+                continue
             inner[bankuai_name] = OrderedDict()
             stock_futures = []
             for index, row in stock_board_industry_cons_em_df.iterrows():
@@ -300,9 +382,8 @@ def get_bankuai_dapan_minute_trend(show=False):
                 stock_futures.append(executor.submit(get_bankuai_stock_data, stock_name, stock_code,stock_rank))
 
             for stock_future in concurrent.futures.as_completed(stock_futures):
-                stock_name, stock_data, stock_rank = stock_future.result()
-                # inner[bankuai_name][stock_name] = [stock_rank,data_test_]
-                inner[bankuai_name][stock_name] = [stock_rank,stock_data,stock_code] #add code
+                stock_name, stock_data, stock_rank, stock_turnover = stock_future.result()
+                inner[bankuai_name][stock_name] = [stock_rank, stock_data, stock_code, stock_turnover]
     print(time.time() - s)
     return outer, inner
 
@@ -544,23 +625,23 @@ class MatplotlibTab:
 
 
 if __name__ == "__main__":  # 测试代码
-    print(get_bankuai_dapan_minute_trend(show=True))
-    # print(data_to_data_frame(get_minutely_data("603660", bankuai=False)))
-    # #上证
-    # 1.000001#上证
-    # 0.399001#深圳
-    # 0.399006#创业板
-    # import akshare as ak
-    # shanghai_index_df = data_to_data_frame(get_minutely_data("0",bankuai=False,dapan=0))
-    # shanghai_index_df = (shanghai_index_df / shanghai_index_df.iloc[0] - 1.0) * 100
-    # sz_index_df = data_to_data_frame(get_minutely_data("0",bankuai=False,dapan=1))
-    # sz_index_df = (sz_index_df / sz_index_df.iloc[0] - 1.0) * 100
-    # chuangye_index_df = data_to_data_frame(get_minutely_data("0",bankuai=False,dapan=2))
-    # chuangye_index_df = (chuangye_index_df / chuangye_index_df.iloc[0] - 1.0) * 100
+    # print(get_bankuai_dapan_minute_trend(show=True))/
+    print(data_to_data_frame(get_minutely_data("603660", bankuai=False)))
+    #上证
+    1.000001#上证
+    0.399001#深圳
+    0.399006#创业板
+    import akshare as ak
+    shanghai_index_df = data_to_data_frame(get_minutely_data("0",bankuai=False,dapan=0))
+    shanghai_index_df = (shanghai_index_df / shanghai_index_df.iloc[0] - 1.0) * 100
+    sz_index_df = data_to_data_frame(get_minutely_data("0",bankuai=False,dapan=1))
+    sz_index_df = (sz_index_df / sz_index_df.iloc[0] - 1.0) * 100
+    chuangye_index_df = data_to_data_frame(get_minutely_data("0",bankuai=False,dapan=2))
+    chuangye_index_df = (chuangye_index_df / chuangye_index_df.iloc[0] - 1.0) * 100
 
-    # stock_board_industry_name_em_df = ak.stock_board_industry_name_em()
-    # stock_board_industry_name_em_df_5 = stock_board_industry_name_em_df.head(6)[["排名","板块名称","板块代码"]]
-    # # print(stock_board_industry_name_em_df_5)
+    stock_board_industry_name_em_df = ak.stock_board_industry_name_em()
+    stock_board_industry_name_em_df_5 = stock_board_industry_name_em_df.head(6)[["排名","板块名称","板块代码"]]
+    print(stock_board_industry_name_em_df_5)
     # # import akshare as ak
     # # fig,axes = plt.sublots(5)
     # fig_bankuai = []

@@ -11,6 +11,7 @@ from datetime import datetime
 import json
 from instock.core.crawling.stock_selection import * 
 from utils import *
+import fwak
 
 #数据库链接密码
 NEO4J_PASSWORD = "root"
@@ -263,18 +264,40 @@ def lhb_yyb_stock_daily_work(start_date="20240725", end_date="20240725",delete=T
                         tx.create(real)
                 
 
-def yyb_stocks2stock_yybs(date_str,youzi_file):
+def yyb_stocks2stock_yybs(date_str,youzi_file="swim_cash3.json"):
     '''
      yz_data.columns = ["营业部名称","游资","风格"]
      stock_lhb_hyyyb_em_df = stock_lhb_hyyyb_em_df[["营业部名称","买入股票"]]
     '''
-    import akshare as ak
-    # for index, row in yyb_df.iterrows():   
-    #添加活跃营业部信息
-    stock_lhb_hyyyb_em_df = ak.stock_lhb_hyyyb_em(start_date=date_str, end_date=date_str)
-    stock_lhb_hyyyb_em_df = stock_lhb_hyyyb_em_df[["营业部名称","买入股票"]]
-    stock_lhb_hyyyb_em_df["买入股票"] = stock_lhb_hyyyb_em_df["买入股票"].apply(lambda x:x.strip().split())
-    # stock_lhb_hyyyb_em_df = stock_lhb_hyyyb_em_df.explode("买入股票")
+    # 如果没有提供date_str，则使用智能判断的交易日
+    if not date_str:
+        from trade_date_utils import get_recent_trade_date
+        date_str = get_recent_trade_date()
+        print(f"自动选择交易日: {date_str}")
+    
+    # 添加活跃营业部信息
+    stock_lhb_hyyyb_em_df = fwak.stock_lhb_hyyyb_em(start_date=date_str, end_date=date_str)
+    
+    # 显示DataFrame信息用于调试
+    print(f"获取到 {len(stock_lhb_hyyyb_em_df)} 条营业部数据")
+    print("DataFrame列名:", stock_lhb_hyyyb_em_df.columns.tolist())
+    
+    # 确保营业部名称列存在
+    if "营业部名称" not in stock_lhb_hyyyb_em_df.columns:
+        raise KeyError("数据中不包含'营业部名称'列")
+    
+    # 检查是否存在买入股票列
+    if "买入股票" not in stock_lhb_hyyyb_em_df.columns:
+        print("警告: 数据中不包含'买入股票'列，将创建空列表")
+        stock_lhb_hyyyb_em_df["买入股票"] = [[] for _ in range(len(stock_lhb_hyyyb_em_df))]
+    else:
+        # 处理买入股票列
+        stock_lhb_hyyyb_em_df["买入股票"] = stock_lhb_hyyyb_em_df["买入股票"].apply(
+            lambda x: x.strip().split() if isinstance(x, str) and x else []
+        )
+    
+    # 只保留需要的列
+    stock_lhb_hyyyb_em_df = stock_lhb_hyyyb_em_df[["营业部名称", "买入股票"]]
     
     if 1:
         #添加游资信息
@@ -296,32 +319,25 @@ def yyb_stocks2stock_yybs(date_str,youzi_file):
     for index, row in stock_lhb_hyyyb_em_df.iterrows():
         # tmp_row = {}
         stocks = row["买入股票"]
-        if stocks:
+        if stocks and isinstance(stocks, list):
             for stock in stocks:
                 new_data.append({"名称" : stock,
                                 "营业部名称" : row["营业部名称"],
                                  "游资" : row["游资"],
                                  "风格" : row["风格"],
                                  })
+        else:
+            # 如果没有具体的股票信息，至少保留营业部信息
+            new_data.append({"名称" : "",
+                            "营业部名称" : row["营业部名称"],
+                             "游资" : row["游资"],
+                             "风格" : row["风格"],
+                             })
     stocks_yyb = pd.DataFrame(new_data)
     
     return stocks_yyb
-            
-
-
-
 
 if __name__ == "__main__":
-    s = time.time()
-    date = getStrDate(1)
-    print(date)
-    ##构建营业部和股票的关系图
-    # lhb_yyb_stock_daily_work(start_date="20240731", end_date="20240731")
-    
-    youzi_file = os.path.join(os.path.dirname(__file__),"swim_cash3.json")
-    stock2yyb = yyb_stocks2stock_yybs(date,youzi_file)
-    # print(stock2yyb)
-    stock2yyb.to_excel(os.path.join(os.path.dirname(__file__) ,"send", f"营业部游资_{datetime.today().strftime('%Y-%m-%d-%H-%M-%S')}.xlsx"))
-    print(f"it cost: {time.time() - s} seconds.")
-    
-    
+    from trade_date_utils import get_recent_trade_date
+    date_str = get_recent_trade_date()
+    yyb_stocks2stock_yybs(date_str,)

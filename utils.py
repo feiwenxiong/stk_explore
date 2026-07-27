@@ -8,8 +8,19 @@ import glob
 import pandas as pd
 import akshare as ak
 from matplotlib import pyplot as plt
-# import time
-# import threading
+import requests
+import random
+import sys
+import os
+# 添加项目路径到sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from instock.lib.http_client import get_session, update_ua
+from instock.lib.akshare_patch import patch_akshare_session, patch_akshare_direct
+
+# 应用akshare补丁
+patch_akshare_session()
+patch_akshare_direct()
+
 
 class DataClass(ABC):
     '''
@@ -69,20 +80,68 @@ def time_diplayer(func, *args, **kwargs):
     t.join()
     return ret
 
+def safe_akshare_call(func, *args, max_retries=3, **kwargs):
+    """安全调用akshare函数，包含重试和延迟机制"""
+    for attempt in range(max_retries):
+        try:
+            # 添加随机延迟，避免触发反爬虫机制
+            time.sleep(random.uniform(0.5, 2.0))
+            result = func(*args, **kwargs)
+            return result
+        except Exception as e:
+            print(f"akshare调用失败 (尝试 {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                # 指数退避延迟
+                time.sleep(2 ** attempt + random.uniform(0, 1))
+            else:
+                raise e
 
-    
 def get_code_name():
     import akshare as ak
-    # 获取所有 A 股股票的实时行情数据
-    stock_zh_a_spot_em = ak.stock_zh_a_spot_em()
-
-    # 提取代码和名称列
-    df = stock_zh_a_spot_em[["代码", "名称"]]
-
-    # 重命名列
-    df.columns = ["code", "name"]  
-    return df,stock_zh_a_spot_em
+    # 尝试多种方法获取股票代码和名称
     
+    # 方法1: 尝试使用stock_info_a_code_name接口
+    try:
+        # 获取所有A股股票列表
+        stock_list = ak.stock_info_a_code_name()
+        # 重命名列
+        stock_list.columns = ["code", "name"]
+        return stock_list, None  # 第二个返回值为None，因为没有详细数据
+    except Exception as e:
+        print(f"使用stock_info_a_code_name获取股票列表失败: {e}")
+    
+    # 方法2: 尝试分别获取上海和深圳股票
+    try:
+        # 获取上海股票
+        sh_stock = ak.stock_sh_a_spot()
+        sh_df = sh_stock[["代码", "名称"]].copy()
+        sh_df.columns = ["code", "name"]
+        sh_df["code"] = "sh" + sh_df["代码"]  # 添加市场前缀
+        
+        # 获取深圳股票
+        sz_stock = ak.stock_sz_a_spot()
+        sz_df = sz_stock[["代码", "名称"]].copy()
+        sz_df.columns = ["code", "name"]
+        sz_df["code"] = "sz" + sz_df["代码"]  # 添加市场前缀
+        
+        # 合并数据
+        combined_df = pd.concat([sh_df, sz_df], ignore_index=True)
+        return combined_df, None
+    except Exception as e:
+        print(f"分别获取沪市和深市股票失败: {e}")
+    
+    # 方法3: 如果以上都失败，使用备选方案从网络获取
+    try:
+        # 使用一个更稳定的接口
+        stock_zh_a_spot = ak.stock_zh_a_spot()
+        df = stock_zh_a_spot[["代码", "名称"]].copy()
+        df.columns = ["code", "name"]
+        return df, stock_zh_a_spot
+    except Exception as e:
+        print(f"使用备选方案获取股票列表也失败了: {e}")
+        # 如果所有方法都失败，返回空的数据框
+        empty_df = pd.DataFrame({"code": [], "name": []})
+        return empty_df, None
 
 def merge_excel_files(directory):
     # 指定包含Excel文件的目录
@@ -197,22 +256,50 @@ def attention_kongpan(folder="trends"):
         data["代码"] = ATTENTION
         dfs = []
         for code in ATTENTION:
-            stock_comment_detail_zlkp_jgcyd_em_df = ak.stock_comment_detail_zlkp_jgcyd_em(symbol=code)
-            tmp_date = stock_comment_detail_zlkp_jgcyd_em_df["date"].map(lambda x:datetime.strftime(x,"%Y%m%d"))
-            start_date = tmp_date[0]
-            end_date = tmp_date.tolist()[-1]
-            stock_zh_a_hist_df = ak.stock_zh_a_hist(symbol=code, 
-                                                    period="daily", 
-                                                    start_date=start_date, 
-                                                    end_date=end_date, 
-                                                    adjust="qfq")
-            stock_comment_detail_zlkp_jgcyd_em_df.rename(columns={"value":"近来控盘比例趋势","date":"日期"},inplace=True)
-            df = pd.merge(stock_zh_a_hist_df,stock_comment_detail_zlkp_jgcyd_em_df,on="日期")
-            name = code_name_df[code_name_df["code"]==code]["name"].tolist()[0]
-            df["名称"] = name
-            # print(df)
-            # trend.append([round(x,2) for x in stock_comment_detail_zlkp_jgcyd_em_df["value"].tolist()])
-            dfs.append(df.copy())
+            try:
+                stock_comment_detail_zlkp_jgcyd_em_df = ak.stock_comment_detail_zlkp_jgcyd_em(symbol=code)
+                
+                # 兼容不同版本的API返回格式
+                date_col = None
+                value_col = None
+                if 'date' in stock_comment_detail_zlkp_jgcyd_em_df.columns:
+                    date_col = 'date'
+                    value_col = 'value' if 'value' in stock_comment_detail_zlkp_jgcyd_em_df.columns else stock_comment_detail_zlkp_jgcyd_em_df.columns[1]
+                elif '交易日' in stock_comment_detail_zlkp_jgcyd_em_df.columns:
+                    date_col = '交易日'
+                    value_col = '机构参与度'
+                else:
+                    date_col = stock_comment_detail_zlkp_jgcyd_em_df.columns[0]
+                    value_col = stock_comment_detail_zlkp_jgcyd_em_df.columns[1]
+                
+                tmp_date = stock_comment_detail_zlkp_jgcyd_em_df[date_col].map(lambda x: pd.to_datetime(x).strftime("%Y%m%d"))
+                start_date = tmp_date.iloc[0]
+                end_date = tmp_date.iloc[-1]
+                # 获取历史K线：优先腾讯前复权，失败则 Sina 不复权
+                try:
+                    stock_zh_a_hist_df = ak.stock_zh_a_hist(symbol=code, 
+                                                            period="daily", 
+                                                            start_date=start_date, 
+                                                            end_date=end_date, 
+                                                            adjust="qfq")
+                except Exception:
+                    stock_zh_a_hist_df = ak.stock_zh_a_hist(symbol=code, 
+                                                            period="daily", 
+                                                            start_date=start_date, 
+                                                            end_date=end_date, 
+                                                            adjust="")
+                
+                stock_comment_detail_zlkp_jgcyd_em_df.rename(
+                    columns={value_col: "近来控盘比例趋势", date_col: "日期"}, inplace=True)
+                df = pd.merge(stock_zh_a_hist_df, stock_comment_detail_zlkp_jgcyd_em_df, on="日期")
+                name = code_name_df[code_name_df["code"]==code]["name"].tolist()[0]
+                df["名称"] = name
+                # print(df)
+                # trend.append([round(x,2) for x in stock_comment_detail_zlkp_jgcyd_em_df["value"].tolist()])
+                dfs.append(df.copy())
+            except Exception as e:
+                print(f"处理股票 {code} 数据时出错: {e}")
+                continue
         return dfs
     
     if not os.path.exists(folder):
@@ -222,166 +309,169 @@ def attention_kongpan(folder="trends"):
     dfs = kongpan_attention_kline_data()
     
     for df in tqdm(dfs):
-        # 修改列名
-        df = df.rename(
-            {
-                "日期": "Date",
-                "开盘": "Open",
-                "收盘": "Close",
-                "最低": "Low",
-                "最高": "High",
-                "成交量": "Volume",
-            },
-            axis=1,
-        )
+        try:
+            # 修改列名
+            df = df.rename(
+                {
+                    "日期": "Date",
+                    "开盘": "Open",
+                    "收盘": "Close",
+                    "最低": "Low",
+                    "最高": "High",
+                    "成交量": "Volume",
+                },
+                axis=1,
+            )
 
-        # 将 Date 列设为索引
-        df.index = df["Date"].astype("datetime64[ns]")
-        df = df.sort_index()
-        # df.set_index('Date', inplace=True)
-        # 确保索引是 DatetimeIndex 类型
-        # df.index = pd.DatetimeIndex(df.index)
-        name = df["名称"].tolist()[0]
-        #plot style
-        mc = mpf.make_marketcolors(up='red',down='green',  volume={'up':'red','down':'green'})
-        style = mpf.make_mpf_style(rc={'font.family': 'SimHei'},
-                                    base_mpf_style= 'yahoo',
-                                    marketcolors=mc)
-        # 计算移动平均线
-        df['MA5'] = df['Close'].rolling(window=5).mean()
-        df['MA10'] = df['Close'].rolling(window=10).mean()
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        
+            # 将 Date 列设为索引
+            df.index = df["Date"].astype("datetime64[ns]")
+            df = df.sort_index()
+            # df.set_index('Date', inplace=True)
+            # 确保索引是 DatetimeIndex 类型
+            # df.index = pd.DatetimeIndex(df.index)
+            name = df["名称"].tolist()[0]
+            #plot style
+            mc = mpf.make_marketcolors(up='red',down='green',  volume={'up':'red','down':'green'})
+            style = mpf.make_mpf_style(rc={'font.family': 'SimHei'},
+                                        base_mpf_style= 'yahoo',
+                                        marketcolors=mc)
+            # 计算移动平均线
+            df['MA5'] = df['Close'].rolling(window=5).mean()
+            df['MA10'] = df['Close'].rolling(window=10).mean()
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+            
 
-        df["mean_kp"] =  df["近来控盘比例趋势"].mean() 
-        df["std_kp"] =  df["近来控盘比例趋势"].std() 
-        df["lowbound_kp"] = df["mean_kp"] - 3 * df["std_kp"]
-        df["upperbound_kp"] = df["mean_kp"] + 3 * df["std_kp"]
-        
-        
-        addplots = [
-                    mpf.make_addplot(df["近来控盘比例趋势"], 
-                                    color="b", 
-                                    width=1,
-                                    ylabel=" control trend ",
-                                    y_on_right=True,
-                                    panel=2,
-                                    type="line",
-                                    # secondary_y=True,
-                                    ),
-                    
-                    mpf.make_addplot(df["mean_kp"] , 
-                                    color="b", 
-                                    width=1,
-                                    # ylabel=" control trend ",
-                                    panel=2,
-                                    type="line",
-                                    # scatter=True,
-                                    linestyle="dashed",
-                                    # secondary_y=True,
-                                    ),
-                     mpf.make_addplot(df["lowbound_kp"], 
-                                    color="green", 
-                                    width=1,
-                                    # ylabel=" control trend ",
-                                    panel=2,
-                                    type="line",
-                                    # scatter=True,
-                                    linestyle="dashed",
-                                    # secondary_y=True,
-                                    ),
-                      mpf.make_addplot(df["upperbound_kp"], 
-                                    color="red", 
-                                    width=1,
-                                    # ylabel=" control trend ",
-                                    panel=2,
-                                    type="line",
-                                    # scatter=True,
-                                    linestyle="dashed",
-                                    # secondary_y=True,
-                                    ),
-                    
-                    
-                    # mpf.make_addplot(df['MA5'], color='blue', width=1, type='line',),
-                    # mpf.make_addplot(df['MA10'], color='orange', width=1, type='line'),
-                    # mpf.make_addplot(df['MA20'], color='green', width=1, type='line',),
-                    
-                    
-                    # mpf.make_addplot(df["upperbound_kp"], 
-                    #                 color="red", 
-                    #                 width=1,
-                    #                 # ylabel=" control trend ",
-                    #                 panel=3,
-                    #                 type="line",
-                    #                 # scatter=True,
-                    #                 linestyle="dashed",
-                    #                 # secondary_y=True,
-                    #                 ),
+            df["mean_kp"] =  df["近来控盘比例趋势"].mean() 
+            df["std_kp"] =  df["近来控盘比例趋势"].std() 
+            df["lowbound_kp"] = df["mean_kp"] - 3 * df["std_kp"]
+            df["upperbound_kp"] = df["mean_kp"] + 3 * df["std_kp"]
+            
+            
+            addplots = [
+                        mpf.make_addplot(df["近来控盘比例趋势"], 
+                                        color="b", 
+                                        width=1,
+                                        ylabel=" control trend ",
+                                        y_on_right=True,
+                                        panel=2,
+                                        type="line",
+                                        # secondary_y=True,
+                                        ),
+                        
+                        mpf.make_addplot(df["mean_kp"] , 
+                                        color="b", 
+                                        width=1,
+                                        # ylabel=" control trend ",
+                                        panel=2,
+                                        type="line",
+                                        # scatter=True,
+                                        linestyle="dashed",
+                                        # secondary_y=True,
+                                        ),
+                         mpf.make_addplot(df["lowbound_kp"], 
+                                        color="green", 
+                                        width=1,
+                                        # ylabel=" control trend ",
+                                        panel=2,
+                                        type="line",
+                                        # scatter=True,
+                                        linestyle="dashed",
+                                        # secondary_y=True,
+                                        ),
+                          mpf.make_addplot(df["upperbound_kp"], 
+                                        color="red", 
+                                        width=1,
+                                        # ylabel=" control trend ",
+                                        panel=2,
+                                        type="line",
+                                        # scatter=True,
+                                        linestyle="dashed",
+                                        # secondary_y=True,
+                                        ),
+                        
+                        
+                        # mpf.make_addplot(df['MA5'], color='blue', width=1, type='line',),
+                        # mpf.make_addplot(df['MA10'], color='orange', width=1, type='line'),
+                        # mpf.make_addplot(df['MA20'], color='green', width=1, type='line',),
+                        
+                        
+                        # mpf.make_addplot(df["upperbound_kp"], 
+                        #                 color="red", 
+                        #                 width=1,
+                        #                 # ylabel=" control trend ",
+                        #                 panel=3,
+                        #                 type="line",
+                        #                 # scatter=True,
+                        #                 linestyle="dashed",
+                        #                 # secondary_y=True,
+                        #                 ),
 
-                    ] 
-        
-        title = f'{name}_{datetime.now().strftime("%Y%m%d")}'
-        kwargs = dict(
-                    type='candle',
-                    volume = True,
-                    mav=(5,10,20),
-                    scale_width_adjustment = dict(volume=0.5, candle=1.15,lines=0.65),
-                    datetime_format='%m%d',
-                    xrotation=90,
-                    title=title,
-                    ylabel='price',
-                    ylabel_lower='volume',
-                    style = style,
-                    addplot=addplots,
-                    # tight_layout=True,
-                    figratio=(14, 8),
-                    figscale=1.,
+                        ] 
+            
+            title = f'{name}_{datetime.now().strftime("%Y%m%d")}'
+            kwargs = dict(
+                        type='candle',
+                        volume = True,
+                        mav=(5,10,20),
+                        scale_width_adjustment = dict(volume=0.5, candle=1.15,lines=0.65),
+                        datetime_format='%m%d',
+                        xrotation=90,
+                        title=title,
+                        ylabel='price',
+                        ylabel_lower='volume',
+                        style = style,
+                        addplot=addplots,
+                        # tight_layout=True,
+                        figratio=(14, 8),
+                        figscale=1.,
+                        
+                    )
+            # fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(10, 8))
+            fig,axes = mpf.plot(df,returnfig=True,**kwargs)
+            
+            #定制一下
+            lines = [plt.Line2D([0], [0], color=color, lw=2) for color in ['blue', 'orange', 'green']]
+            labels = ['MA5', 'MA10', 'MA20']
+            axes[0].legend(lines, labels, loc='upper left')
+            
+            
+            #最高最低3点
+            # 找出最低和最高的3个点
+            lowest_points = df.nsmallest(3, '近来控盘比例趋势')
+            highest_points = df.nlargest(3, '近来控盘比例趋势')
+            # 准备散点数据
+            scatter_lowest = lowest_points[['近来控盘比例趋势']]
+            scatter_highest = highest_points[['近来控盘比例趋势']]
+            
+           
+            id_ = 4  # The index of the panel where control trend is plotted
+            axes[id_].scatter(df.index.strftime('%m%d'),df["近来控盘比例趋势"],color="b",marker="o",s=2)
+            axes[id_].scatter(scatter_lowest.index.strftime('%m%d'),scatter_lowest["近来控盘比例趋势"],color="green",marker="s",s=10)
+            axes[id_].scatter(scatter_highest.index.strftime('%m%d'),scatter_highest["近来控盘比例趋势"],color="red",marker="s",s=10)
+            
+            for idx, row in scatter_lowest.iterrows():
+                date = idx.strftime('%m%d')
+                value = row['近来控盘比例趋势']
+                axes[id_].annotate(f'{value:.2f}%', (date, value), textcoords="offset points", xytext=(5, 10), ha='center')
+            for idx, row in scatter_highest.iterrows():
+                date = idx.strftime('%m%d')
+                value = row['近来控盘比例趋势']
+                axes[id_].annotate(f'{value:.2f}%', (date, value), textcoords="offset points", xytext=(5, -10), ha='center')
+
                     
-                )
-        # fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(10, 8))
-        fig,axes = mpf.plot(df,returnfig=True,**kwargs)
-        
-        #定制一下
-        lines = [plt.Line2D([0], [0], color=color, lw=2) for color in ['blue', 'orange', 'green']]
-        labels = ['MA5', 'MA10', 'MA20']
-        axes[0].legend(lines, labels, loc='upper left')
-        
-        
-        #最高最低3点
-        # 找出最低和最高的3个点
-        lowest_points = df.nsmallest(3, '近来控盘比例趋势')
-        highest_points = df.nlargest(3, '近来控盘比例趋势')
-        # 准备散点数据
-        scatter_lowest = lowest_points[['近来控盘比例趋势']]
-        scatter_highest = highest_points[['近来控盘比例趋势']]
-        
-       
-        id_ = 4  # The index of the panel where control trend is plotted
-        axes[id_].scatter(df.index.strftime('%m%d'),df["近来控盘比例趋势"],color="b",marker="o",s=2)
-        axes[id_].scatter(scatter_lowest.index.strftime('%m%d'),scatter_lowest["近来控盘比例趋势"],color="green",marker="s",s=10)
-        axes[id_].scatter(scatter_highest.index.strftime('%m%d'),scatter_highest["近来控盘比例趋势"],color="red",marker="s",s=10)
-        
-        for idx, row in scatter_lowest.iterrows():
-            date = idx.strftime('%m%d')
-            value = row['近来控盘比例趋势']
-            axes[id_].annotate(f'{value:.2f}%', (date, value), textcoords="offset points", xytext=(5, 10), ha='center')
-        for idx, row in scatter_highest.iterrows():
-            date = idx.strftime('%m%d')
-            value = row['近来控盘比例趋势']
-            axes[id_].annotate(f'{value:.2f}%', (date, value), textcoords="offset points", xytext=(5, -10), ha='center')
-
-                
-        
-        #
-        # ax_new = fig.add_subplot(414)
-        # ax_new.plot()
-        # ax_new.scatter(scatter_lowest.index.strftime('%m%d'),scatter_lowest["近来控盘比例趋势"],color="green",marker="s",s=10)
-        # ax_new.scatter(scatter_highest.index.strftime('%m%d'),scatter_highest["近来控盘比例趋势"],color="red",marker="s",s=10)
-        
-        # fig.tight_layout()
-        
-        fig.savefig(f'{folder}/{title}.png',format="png")
-
+            
+            #
+            # ax_new = fig.add_subplot(414)
+            # ax_new.plot()
+            # ax_new.scatter(scatter_lowest.index.strftime('%m%d'),scatter_lowest["近来控盘比例趋势"],color="green",marker="s",s=10)
+            # ax_new.scatter(scatter_highest.index.strftime('%m%d'),scatter_highest["近来控盘比例趋势"],color="red",marker="s",s=10)
+            
+            # fig.tight_layout()
+            
+            fig.savefig(f'{folder}/{title}.png',format="png")
+        except Exception as e:
+            print(f"绘制股票图表时出错: {e}")
+            continue
 
 def attention_kongpan2(folder="trends"):
     import mplfinance as mpf
@@ -399,22 +489,50 @@ def attention_kongpan2(folder="trends"):
         data["代码"] = ATTENTION
         dfs = []
         for code in ATTENTION:
-            stock_comment_detail_zlkp_jgcyd_em_df = ak.stock_comment_detail_zlkp_jgcyd_em(symbol=code)
-            tmp_date = stock_comment_detail_zlkp_jgcyd_em_df["date"].map(lambda x:datetime.strftime(x,"%Y%m%d"))
-            start_date = tmp_date[0]
-            end_date = tmp_date.tolist()[-1]
-            stock_zh_a_hist_df = ak.stock_zh_a_hist(symbol=code, 
-                                                    period="daily", 
-                                                    start_date=start_date, 
-                                                    end_date=end_date, 
-                                                    adjust="qfq")
-            stock_comment_detail_zlkp_jgcyd_em_df.rename(columns={"value":"近来控盘比例趋势","date":"日期"},inplace=True)
-            df = pd.merge(stock_zh_a_hist_df,stock_comment_detail_zlkp_jgcyd_em_df,on="日期")
-            name = code_name_df[code_name_df["code"]==code]["name"].tolist()[0]
-            df["名称"] = name
-            # print(df)
-            # trend.append([round(x,2) for x in stock_comment_detail_zlkp_jgcyd_em_df["value"].tolist()])
-            dfs.append(df.copy())
+            try:
+                stock_comment_detail_zlkp_jgcyd_em_df = ak.stock_comment_detail_zlkp_jgcyd_em(symbol=code)
+                
+                # 兼容不同版本的API返回格式
+                date_col = None
+                value_col = None
+                if 'date' in stock_comment_detail_zlkp_jgcyd_em_df.columns:
+                    date_col = 'date'
+                    value_col = 'value' if 'value' in stock_comment_detail_zlkp_jgcyd_em_df.columns else stock_comment_detail_zlkp_jgcyd_em_df.columns[1]
+                elif '交易日' in stock_comment_detail_zlkp_jgcyd_em_df.columns:
+                    date_col = '交易日'
+                    value_col = '机构参与度'
+                else:
+                    date_col = stock_comment_detail_zlkp_jgcyd_em_df.columns[0]
+                    value_col = stock_comment_detail_zlkp_jgcyd_em_df.columns[1]
+                
+                tmp_date = stock_comment_detail_zlkp_jgcyd_em_df[date_col].map(lambda x: pd.to_datetime(x).strftime("%Y%m%d"))
+                start_date = tmp_date.iloc[0]
+                end_date = tmp_date.iloc[-1]
+                # 获取历史K线：优先腾讯前复权，失败则 Sina 不复权
+                try:
+                    stock_zh_a_hist_df = ak.stock_zh_a_hist(symbol=code, 
+                                                            period="daily", 
+                                                            start_date=start_date, 
+                                                            end_date=end_date, 
+                                                            adjust="qfq")
+                except Exception:
+                    stock_zh_a_hist_df = ak.stock_zh_a_hist(symbol=code, 
+                                                            period="daily", 
+                                                            start_date=start_date, 
+                                                            end_date=end_date, 
+                                                            adjust="")
+                
+                stock_comment_detail_zlkp_jgcyd_em_df.rename(
+                    columns={value_col: "近来控盘比例趋势", date_col: "日期"}, inplace=True)
+                df = pd.merge(stock_zh_a_hist_df, stock_comment_detail_zlkp_jgcyd_em_df, on="日期")
+                name = code_name_df[code_name_df["code"]==code]["name"].tolist()[0]
+                df["名称"] = name
+                # print(df)
+                # trend.append([round(x,2) for x in stock_comment_detail_zlkp_jgcyd_em_df["value"].tolist()])
+                dfs.append(df.copy())
+            except Exception as e:
+                print(f"处理股票 {code} 数据时出错: {e}")
+                continue
         return dfs
     
     if not os.path.exists(folder):
@@ -424,126 +542,136 @@ def attention_kongpan2(folder="trends"):
     dfs = kongpan_attention_kline_data()
     
     for df in tqdm(dfs):
-        # 修改列名
-        df = df.rename(
-            {
-                "日期": "Date",
-                "开盘": "Open",
-                "收盘": "Close",
-                "最低": "Low",
-                "最高": "High",
-                "成交量": "Volume",
-            },
-            axis=1,
-        )
+        try:
+            # 修改列名
+            df = df.rename(
+                {
+                    "日期": "Date",
+                    "开盘": "Open",
+                    "收盘": "Close",
+                    "最低": "Low",
+                    "最高": "High",
+                    "成交量": "Volume",
+                },
+                axis=1,
+            )
 
-        # 将 Date 列设为索引
-        df.index = df["Date"].astype("datetime64[ns]")
-        df = df.sort_index()
-        name = df["名称"].tolist()[0]
-        #plot style
-        mc = mpf.make_marketcolors(up='red',down='green',  volume={'up':'red','down':'green'})
-        style = mpf.make_mpf_style(rc={'font.family': 'SimHei'},
-                                    base_mpf_style= 'yahoo',
-                                    marketcolors=mc)
-        # 计算移动平均线
-        df['MA5'] = df['Close'].rolling(window=5).mean()
-        df['MA10'] = df['Close'].rolling(window=10).mean()
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        
+            # 将 Date 列设为索引
+            df.index = df["Date"].astype("datetime64[ns]")
+            df = df.sort_index()
+            name = df["名称"].tolist()[0]
+            #plot style
+            mc = mpf.make_marketcolors(up='red',down='green',  volume={'up':'red','down':'green'})
+            style = mpf.make_mpf_style(rc={'font.family': 'SimHei'},
+                                        base_mpf_style= 'yahoo',
+                                        marketcolors=mc)
+            # 计算移动平均线
+            df['MA5'] = df['Close'].rolling(window=5).mean()
+            df['MA10'] = df['Close'].rolling(window=10).mean()
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+            
 
-        df["mean_kp"] =  df["近来控盘比例趋势"].mean() 
-        df["std_kp"] =  df["近来控盘比例趋势"].std() 
-        df["lowbound_kp"] = df["mean_kp"] - 3 * df["std_kp"]
-        df["upperbound_kp"] = df["mean_kp"] + 3 * df["std_kp"]
-        
-        
-        
-        # 创建一个 Figure 和多个子图
-        fig, axes = plt.subplots(3,
-                                 1, 
-                                figsize=(14, 8), 
-                                gridspec_kw={'height_ratios': [3, 1, 1]}, 
-                                sharex=True)
+            df["mean_kp"] =  df["近来控盘比例趋势"].mean() 
+            df["std_kp"] =  df["近来控盘比例趋势"].std() 
+            df["lowbound_kp"] = df["mean_kp"] - 3 * df["std_kp"]
+            df["upperbound_kp"] = df["mean_kp"] + 3 * df["std_kp"]
+            
+            
+            
+            # 创建一个 Figure 和多个子图
+            fig, axes = plt.subplots(3,
+                                     1, 
+                                    figsize=(14, 8), 
+                                    gridspec_kw={'height_ratios': [3, 1, 1]}, 
+                                    sharex=True)
 
-        title = f'{name}_{datetime.now().strftime("%Y%m%d")}'
-        # fig.suptitle(title)
-        
-        # 使用 mplfinance 绘制 K 线图
-        mpf_fig = mpf.plot(df, type='candle', 
-                 ax=axes[0], 
-                 volume=False, 
-                #  mav=(5, 10, 20),
-                style=style, 
-                datetime_format='%m%d', 
-                xrotation=90, 
-                title=name,
-                ylabel='price',)
-        
-        # 设置图例
-        axes[0].legend(loc='upper left')
-        
-        
-        # 使用 matplotlib 绘制交易量
-        colors = df['Close'] > df['Open']
-        colors = colors.map({True: 'red', False: 'green'})
-        axes[1].bar(df.index, df['Volume'], color=colors, alpha=0.4)
-        axes[1].set_ylabel('Volume')
-        
-        
-        # 使用 matplotlib 绘制控盘比例趋势
-        axes[2].plot(df.index.strftime('%m%d'), df["近来控盘比例趋势"], color="b", label="Control Trend")
-        axes[2].plot(df.index.strftime('%m%d'), df["mean_kp"], color="b", linestyle="dashed", label="Mean")
-        axes[2].plot(df.index.strftime('%m%d'), df["lowbound_kp"], color="green", linestyle="dashed", label="Lower Bound")
-        axes[2].plot(df.index.strftime('%m%d'), df["upperbound_kp"], color="red", linestyle="dashed", label="Upper Bound")
+            title = f'{name}_{datetime.now().strftime("%Y%m%d")}'
+            # fig.suptitle(title)
+            
+            # 使用 mplfinance 绘制 K 线图
+            mpf_fig = mpf.plot(df, type='candle', 
+                     ax=axes[0], 
+                     volume=False, 
+                    #  mav=(5, 10, 20),
+                    style=style, 
+                    datetime_format='%m%d', 
+                    xrotation=90, 
+                    title=name,
+                    ylabel='price',)
+            
+            # 设置图例
+            axes[0].legend(loc='upper left')
+            
+            
+            # 使用 matplotlib 绘制交易量
+            colors = df['Close'] > df['Open']
+            colors = colors.map({True: 'red', False: 'green'})
+            axes[1].bar(df.index, df['Volume'], color=colors, alpha=0.4)
+            axes[1].set_ylabel('Volume')
+            
+            
+            # 使用 matplotlib 绘制控盘比例趋势
+            axes[2].plot(df.index.strftime('%m%d'), df["近来控盘比例趋势"], color="b", label="Control Trend")
+            axes[2].plot(df.index.strftime('%m%d'), df["mean_kp"], color="b", linestyle="dashed", label="Mean")
+            axes[2].plot(df.index.strftime('%m%d'), df["lowbound_kp"], color="green", linestyle="dashed", label="Lower Bound")
+            axes[2].plot(df.index.strftime('%m%d'), df["upperbound_kp"], color="red", linestyle="dashed", label="Upper Bound")
 
-        
-        
-        
-        
-        # #定制一下
-        # lines = [plt.Line2D([0], [0], color=color, lw=2) for color in ['blue', 'orange', 'green']]
-        # labels = ['MA5', 'MA10', 'MA20']
-        # axes[0].legend(lines, labels, loc='upper left')
-        
-        
-        #最高最低3点
-        # 找出最低和最高的3个点
-        lowest_points = df.nsmallest(3, '近来控盘比例趋势')
-        highest_points = df.nlargest(3, '近来控盘比例趋势')
-        # 准备散点数据
-        scatter_lowest = lowest_points[['近来控盘比例趋势']]
-        scatter_highest = highest_points[['近来控盘比例趋势']]
-        
-       
-        id_ = 2  # The index of the panel where control trend is plotted
-        axes[2].scatter(df.index.strftime('%m%d'),df["近来控盘比例趋势"],color="b",marker="o",s=2)
-        axes[2].scatter(scatter_lowest.index.strftime('%m%d'),scatter_lowest["近来控盘比例趋势"],color="green",marker="s",s=10)
-        axes[2].scatter(scatter_highest.index.strftime('%m%d'),scatter_highest["近来控盘比例趋势"],color="red",marker="s",s=10)
-        
-        for idx, row in scatter_lowest.iterrows():
-            date = idx.strftime('%m%d')
-            value = row['近来控盘比例趋势']
-            axes[2].annotate(f'{value:.2f}%', (date, value), textcoords="offset points", xytext=(5, 10), ha='center')
-        for idx, row in scatter_highest.iterrows():
-            date = idx.strftime('%m%d')
-            value = row['近来控盘比例趋势']
-            axes[2].annotate(f'{value:.2f}%', (date, value), textcoords="offset points", xytext=(5, -10), ha='center')
+            
+            
+            
+            
+            # #定制一下
+            # lines = [plt.Line2D([0], [0], color=color, lw=2) for color in ['blue', 'orange', 'green']]
+            # labels = ['MA5', 'MA10', 'MA20']
+            # axes[0].legend(lines, labels, loc='upper left')
+            
+            
+            #最高最低3点
+            # 找出最低和最高的3个点
+            lowest_points = df.nsmallest(3, '近来控盘比例趋势')
+            highest_points = df.nlargest(3, '近来控盘比例趋势')
+            # 准备散点数据
+            scatter_lowest = lowest_points[['近来控盘比例趋势']]
+            scatter_highest = highest_points[['近来控盘比例趋势']]
+            
+           
+            id_ = 2  # The index of the panel where control trend is plotted
+            axes[2].scatter(df.index.strftime('%m%d'),df["近来控盘比例趋势"],color="b",marker="o",s=2)
+            axes[2].scatter(scatter_lowest.index.strftime('%m%d'),scatter_lowest["近来控盘比例趋势"],color="green",marker="s",s=10)
+            axes[2].scatter(scatter_highest.index.strftime('%m%d'),scatter_highest["近来控盘比例趋势"],color="red",marker="s",s=10)
+            
+            for idx, row in scatter_lowest.iterrows():
+                date = idx.strftime('%m%d')
+                value = row['近来控盘比例趋势']
+                axes[2].annotate(f'{value:.2f}%', (date, value), textcoords="offset points", xytext=(5, 10), ha='center')
+            for idx, row in scatter_highest.iterrows():
+                date = idx.strftime('%m%d')
+                value = row['近来控盘比例趋势']
+                axes[2].annotate(f'{value:.2f}%', (date, value), textcoords="offset points", xytext=(5, -10), ha='center')
 
-                
-        
-        fig.savefig(f'{folder}/{title}.png',format="png")
+                    
+            fig.savefig(f'{folder}/{title}.png',format="png")
+        except Exception as e:
+            print(f"绘制股票图表时出错: {e}")
+            continue
 
+_cached_trade_date = None
+_cache_date_str = None
 
 def closest_trade_date():
-    # from instock.crawling.trade_date_hist import tool_trade_date_hist_sina
+    """获取最近交易日（带缓存，一天内不重复请求）"""
+    global _cached_trade_date, _cache_date_str
+    from datetime import datetime
+    today_str = datetime.now().strftime("%Y%m%d")
+    if _cached_trade_date is not None and _cache_date_str == today_str:
+        return _cached_trade_date
+    
     import akshare as ak
     tool_trade_date_hist_df = ak.tool_trade_date_hist_sina()
-    # print(tool_trade_date_hist_df)
-    from datetime import datetime
-    # print(datetime.now().strftime("%Y-%m-%d"))
     t = tool_trade_date_hist_df[tool_trade_date_hist_df["trade_date"] <= datetime.now().date()].iloc[-1].values[0].strftime("%Y%m%d")
-    # print(t)
+    
+    _cached_trade_date = t
+    _cache_date_str = today_str
     return t
 
 
@@ -555,10 +683,11 @@ def is_now_open():
     current_date = now.date().strftime("%Y%m%d")
     if current_date > trade_closest_date:
         return False
-    else:
-        start_time = datetime.combine(now.date(), time(9, 30))  # 构造今天的9点半时间  
-        end_time = datetime.combine(now.date(), time(15, 0))    # 构造今天的15点时间  
-        return start_time <= now <= end_time 
+    if current_date < trade_closest_date:
+        return False  # 今天不是交易日
+    start_time = datetime.combine(now.date(), time(9, 30))  # 构造今天的9点半时间  
+    end_time = datetime.combine(now.date(), time(15, 0))    # 构造今天的15点时间  
+    return start_time <= now <= end_time 
 
 def is_now_break():
     from datetime import datetime,time
@@ -567,6 +696,9 @@ def is_now_break():
     end_time = datetime.combine(now.date(), time(12, 59))    # 构造今天的15点时间  
     return start_time <= now <= end_time
 
+ 
+ 
+ 
  
 if __name__ == "__main__":
     
