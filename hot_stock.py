@@ -13,11 +13,10 @@ import sys
 import os
 # 添加项目路径到sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from instock.lib.akshare_patch import patch_akshare_session, patch_akshare_direct
+from instock.lib.akshare_patch import patch_akshare_all
 
-# 应用akshare补丁
-patch_akshare_session()
-patch_akshare_direct()
+# 应用akshare补丁（含requests Session、直接调用、curl_cffi）
+patch_akshare_all()
 
 def getTodayStock(save=True) -> pd.DataFrame:
     '''
@@ -34,34 +33,75 @@ def getTodayStock(save=True) -> pd.DataFrame:
     return stock_selection_df
 
 def earn_money_xiaoying():
-    '''赚钱效应
+    '''赚钱效应 — 从东方财富实时行情计算（替代已失效的 legulegu 接口）
     return format:
                         item                value
-            0         上涨               1198.0
-            1         涨停                 26.0
-            2       真实涨停                 22.0
-            3   st st*涨停                  1.0
-            4         下跌               3879.0
-            5         跌停                333.0
-            6       真实跌停                268.0
-            7   st st*跌停                 77.0
-            8         平盘                 37.0
-            9         停牌                  2.0
-            10       活跃度               23.42%
-            11      统计日期  2024-04-15 15:00:00
+    0         上涨               1198.0
+    1         涨停                 26.0
+    2       真实涨停                 22.0
+    3   st st*涨停                  1.0
+    4         下跌               3879.0
+    5         跌停                333.0
+    6       真实跌停                268.0
+    7   st st*跌停                 77.0
+    8         平盘                 37.0
+    9         停牌                  2.0
+    10       活跃度               23.42%
+    11      统计日期  2024-04-15 15:00:00
     '''
-    import akshare as ak
     import logging
     logger = logging.getLogger(__name__)
     try:
-        stock_market_activity_legu_df = ak.stock_market_activity_legu()
-        stock_market_activity_legu_df.index = stock_market_activity_legu_df["item"]
-        stock_market_activity_legu_df.drop("item", axis=1, inplace=True)
-        return stock_market_activity_legu_df.T
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
+        if df is None or df.empty:
+            return _earn_money_fallback()
+
+        close_col = [c for c in df.columns if "最新" in c or "收盘" in c or "close" in c.lower()]
+        change_col = [c for c in df.columns if "涨跌幅" in c or "change" in c.lower()]
+        name_col = [c for c in df.columns if "名称" in c or "name" in c.lower()]
+
+        if not change_col:
+            return _earn_money_fallback()
+
+        change_series = df[change_col[0]].astype(float)
+        total = len(df)
+        up = int((change_series > 0).sum())
+        down = int((change_series < 0).sum())
+        flat = int(total - up - down)
+
+        # 涨停判定: 主板10%, 科创/创业板20%, 北交所30%
+        # 简化: >= 9.5% 视为涨停（含ST的5%不好判断）
+        zt = int((change_series >= 9.5).sum())
+        dt = int((change_series <= -9.5).sum())
+
+        # 活跃度 = (上涨+下跌) / 总数 * 100
+        activity = round((up + down) / total * 100, 2) if total > 0 else 0
+
+        data = {
+            "item": ["上涨", "涨停", "真实涨停", "st st*涨停",
+                     "下跌", "跌停", "真实跌停", "st st*跌停",
+                     "平盘", "停牌", "活跃度", "统计日期"],
+            "value": [up, zt, zt, 0,
+                      down, dt, dt, 0,
+                      flat, 0, f"{activity}%",
+                      datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+        }
+        result = pd.DataFrame(data)
+        result.index = result["item"]
+        result.drop("item", axis=1, inplace=True)
+        return result.T
     except Exception as e:
-        logger.warning(f"获取赚钱效应数据失败 (legulegu.com 可能改版): {e}")
-        # 返回空 DataFrame，让调用方优雅降级
-        return pd.DataFrame()
+        logger.warning(f"从实时行情计算赚钱效应失败: {e}")
+        return _earn_money_fallback()
+
+
+def _earn_money_fallback():
+    """返回空DataFrame作为兜底"""
+    return pd.DataFrame()
+
+
+earn_money_xiaoying._fallback = _earn_money_fallback
 
 def kongpan_attention():
     '''筛选关注文件中的股票的最近的控盘率走势

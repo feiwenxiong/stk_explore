@@ -15,11 +15,10 @@ import os
 # 添加项目路径到sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from instock.lib.http_client import get_session, update_ua
-from instock.lib.akshare_patch import patch_akshare_session, patch_akshare_direct
+from instock.lib.akshare_patch import patch_akshare_all
 
-# 应用akshare补丁
-patch_akshare_session()
-patch_akshare_direct()
+# 应用akshare补丁（含requests Session、直接调用、curl_cffi）
+patch_akshare_all()
 
 
 class DataClass(ABC):

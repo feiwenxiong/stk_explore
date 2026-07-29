@@ -1,39 +1,142 @@
 from matplotlib import pyplot as plt
 import time
-from matplotlib.widgets import Cursor,MultiCursor
-plt.rcParams['font.sans-serif'] = ['SimHei'] # 指定默认字体
-plt.rcParams['axes.unicode_minus'] = False   # 解决保存图像是负号'-'显示为方块的问题
+from matplotlib.widgets import Cursor, MultiCursor
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
 import json
-import requests
 import logging
 import io
 import random
 import pandas as pd
 import ttkbootstrap as ttk
-# import ttkinter as ttk
 import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from matplotlib.lines import Line2D
-import requests
-import logging
-import io
-import pandas as pd
-import json
-from matplotlib import pyplot as plt
 from collections import OrderedDict
-from utils import is_now_break,is_now_open
-import akshare as ak
+from utils import is_now_break, is_now_open
 import concurrent.futures
 import threading
 import sys
 import os
-# 添加项目路径到sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from instock.lib.http_client import get_session, update_ua
 
-# 注意：akshare patch 由 ggui.py 统一管理，此处不再重复调用
-# from instock.lib.akshare_patch import patch_akshare_session, patch_akshare_direct
+_HTTP_SESSION = None
+_HTTP_SESSION_PUSH2 = None
+
+def _get_http():
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        _HTTP_SESSION = get_session()
+    update_ua(_HTTP_SESSION)
+    return _HTTP_SESSION
+
+def _get_http_push2():
+    """独立session用于push2.eastmoney.com，避免与push2his的并发连接冲突"""
+    global _HTTP_SESSION_PUSH2
+    if _HTTP_SESSION_PUSH2 is None:
+        sess = get_session()
+        # 独立的User-Agent
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        _HTTP_SESSION_PUSH2 = sess
+    update_ua(_HTTP_SESSION_PUSH2)
+    return _HTTP_SESSION_PUSH2
+
+# --- 直接HTTP API获取（替换akshare调用） ---
+
+# 东方财富多主机轮换，避免单服务器限流
+# 实测 45.push2his / 60.push2his / 82.push2 等子域名有时无法解析
+# 所以主要依赖主域名 + 请求间隔来控制限流
+_PUSH2_HOSTS = ["https://push2.eastmoney.com"]
+_PUSH2HIS_HOSTS = ["https://push2his.eastmoney.com"]
+_hostIdx = {"push2": 0, "push2his": 0}
+
+def _rotate_host(domain="push2his"):
+    """轮换API主机"""
+    hosts = _PUSH2HIS_HOSTS if domain == "push2his" else _PUSH2_HOSTS
+    global _hostIdx
+    idx = _hostIdx.get(domain, 0)
+    host = hosts[idx % len(hosts)]
+    _hostIdx[domain] = idx + 1
+    return host
+
+_PUSH2_URL_TMPL = "{host}/api/qt/clist/get"
+_UT = "bd1d9ddb04089700cf9c27f6f7426281"
+
+def _http_board_list(max_retries=3):
+    """直接HTTP获取行业板块TOP N列表"""
+    url = _PUSH2_URL_TMPL.format(host=_rotate_host("push2"))
+    params = {
+        "pn": "1", "pz": "50", "po": "1",
+        "np": "1", "ut": _UT, "fltt": "2", "invt": "2", "fid": "f3",
+        "fs": "m:90+t:2",
+        "fields": "f12,f14,f2,f3,f4,f8,f20,f21",
+    }
+    for attempt in range(max_retries):
+        try:
+            r = _get_http_push2().get(url, params=params, timeout=10)
+            data = r.json()
+            if data.get("data") and data["data"].get("diff"):
+                items = data["data"]["diff"]
+                # 按涨幅降序排列，取前N
+                items.sort(key=lambda x: x.get("f3", 0) or 0, reverse=True)
+                result = []
+                for i, item in enumerate(items):
+                    result.append({
+                        "rank": i + 1,
+                        "name": item.get("f14", ""),
+                        "code": item.get("f12", ""),
+                        "changePct": item.get("f3") or 0,  # 涨跌幅
+                    })
+                return result
+            return []
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                logging.warning(f"[_http_board_list] 获取板块列表失败: {e}")
+                return []
+
+def _http_board_stocks(board_code, max_retries=3):
+    """直接HTTP获取板块成分股TOP列表（含流通市值）"""
+    url = _PUSH2_URL_TMPL.format(host=_rotate_host("push2"))
+    params = {
+        "pn": "1", "pz": "30", "po": "1",
+        "np": "1", "ut": _UT, "fltt": "2", "invt": "2", "fid": "f3",
+        "fs": f"b:{board_code}",
+        "fields": "f12,f14,f2,f3,f4,f5,f6,f7,f8,f15,f16,f20,f21",
+    }
+    for attempt in range(max_retries):
+        try:
+            r = _get_http_push2().get(url, params=params, timeout=10)
+            data = r.json()
+            if data.get("data") and data["data"].get("diff"):
+                items = data["data"]["diff"]
+                # 按涨跌幅排序
+                items.sort(key=lambda x: x.get("f3", 0) or 0, reverse=True)
+                result = []
+                for i, item in enumerate(items):
+                    price = item.get("f2") or 0
+                    circ_mktcap = item.get("f21") or 0  # 流通市值(元)
+                    # 流通股本 = 流通市值 / 最新价
+                    circ_shares = circ_mktcap / price if price > 0 else 0
+                    result.append({
+                        "rank": i + 1,
+                        "name": item.get("f14", ""),
+                        "code": item.get("f12", ""),
+                        "price": price,
+                        "changePct": item.get("f3") or 0,
+                        "turnoverRate": item.get("f8") or 0,  # 日换手率%
+                        "circShares": circ_shares,  # 流通股数
+                    })
+                return result
+            return []
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                logging.warning(f"[_http_board_stocks] {board_code} 成分股获取失败: {e}")
+                return []
 
 
 def _get_market_code(stock_code):
@@ -74,56 +177,56 @@ def _handle_event(event_data) -> str:
     # logger.info(f"data received: {data}")
     return data
 
-def get_minutely_data(code: str,bankuai=False,dapan=-1) -> dict:
-    """
-    获取最新的分时数据
-    :param code: 股票代码，6位数字格式，比如：“000001”。
-    :return: 数据字典
-    """
-    # url格式，需要调用者依次填充：市场代码（0：深圳，0：上海），股票代码，日期窗口
-    url_format = "https://45.push2.eastmoney.com/api/qt/stock/trends2/sse?fields1=f1,f2,f3,f4,f5,f6,f7,f8," \
-                 "f9,f10,f11,f12,f13,f14,f17&fields2=f51,f52,f53,f54,f55,f56,f57," \
-                 "f58&mpi=1000&ut=fa5fd1943c7b386f172d6893dbfba10b&secid={market}.{code}" \
-                 "&ndays={days}&iscr=0&iscca=0&wbp2u=1849325530509956|0|1|0|web"
-    if not bankuai:
-        url = url_format.format(market=_get_market_code(code), code=code, days=1)  # 请求url
-    else:
-        url = url_format.format(market=90, code=code, days=1) #板块
-    if dapan == 0:
-        url = url_format.format(market=1, code="000001", days=1) # 上证指数
-    elif dapan == 1:
-        url = url_format.format(market=0, code="399001", days=1) #深证指数
-    elif dapan == 2:
-        url = url_format.format(market=0, code="399006", days=1) #创业指数
-    else:
-        pass
+def get_minutely_data(code: str, bankuai=False, dapan=-1) -> dict:
+    """获取最新的分时数据，自动轮换API主机。push2his失败时自动fallback到push2主机。"""
+    # push2his 对部分代码和接口会返回空数据或RemoteDisconnected
+    # 因此所有类型都启用 push2his -> push2 两级fallback
+    target_hosts = ["push2his", "push2"]
 
-    # 使用统一配置的HTTP客户端
-    session = get_session()
-    
-    # 更新User-Agent以避免反爬虫
-    update_ua(session)
-
-    try:
-        response = session.get(url, stream=True, timeout=10)  # 请求数据，开启流式传输
-
-        if response.status_code == 200:
-            event_data = ""
-            for chunk in response.iter_content(chunk_size=None):  # 不断地获取数据
-                data_decoded = chunk.decode('utf-8')  # 将字节流解码成字符串
-                event_data += data_decoded
-                parts = event_data.split('\n\n')
-                if len(parts) > 1:  # 获取到一条完整的事件后，对数据进行解析。
-                    data = _handle_event(parts[0])
-                    result = json.loads(data)
-                    if "data" not in result or result["data"] is None:
-                        raise ValueError(f"SSE返回空数据: code={code}")
-                    return result
+    for domain in target_hosts:
+        host = _rotate_host(domain)
+        url_format = "{host}/api/qt/stock/trends2/get?fields1=f1,f2,f3,f4,f5,f6,f7,f8," \
+                     "f9,f10,f11,f12,f13,f14,f17&fields2=f51,f52,f53,f54,f55,f56,f57," \
+                     "f58&mpi=1000&ut=fa5fd1943c7b386f172d6893dbfba10b&secid={market}.{code}" \
+                     "&ndays={days}&iscr=0&iscca=0"
+        url_format = url_format.replace("{host}", host)
+        if not bankuai:
+            url = url_format.format(market=_get_market_code(code), code=code, days=1)
         else:
-            raise ConnectionError(f"HTTP {response.status_code}: code={code}")
-    except Exception as e:
-        logging.warning(f"[get_minutely_data] 获取分时数据失败 (code={code}): {e}")
-        return None
+            # 板块代码如 "BK0507"，API 只接受纯数字部分
+            if code.startswith("BK"):
+                code = code[2:]
+            url = url_format.format(market=90, code=code, days=1)
+        if dapan == 0:
+            url = url_format.format(market=1, code="000001", days=1)
+        elif dapan == 1:
+            url = url_format.format(market=0, code="399001", days=1)
+        elif dapan == 2:
+            url = url_format.format(market=0, code="399006", days=1)
+        else:
+            pass
+
+        session = get_session()
+        update_ua(session)
+
+        try:
+            response = session.get(url, timeout=10)
+            if response.status_code == 200:
+                result = response.json()
+                if "data" not in result or result["data"] is None:
+                    raise ValueError(f"API返回空数据: code={code}")
+                return result
+            else:
+                raise ConnectionError(f"HTTP {response.status_code}: code={code}")
+        except Exception as e:
+            if domain == target_hosts[-1]:
+                # 最后一个host也失败，才记录告警
+                logging.warning(f"[get_minutely_data] 获取分时数据失败 (code={code}): {e}")
+                return None
+            else:
+                # 还有fallback主机，静默重试
+                logging.info(f"[get_minutely_data] {domain}失败，尝试fallback (code={code}): {e}")
+                continue
 
 
 
@@ -275,117 +378,119 @@ def get_bankuai_data(bankuai_name, bankuai_code,bankuai_rank):
     data_test = (data_test / data_test.iloc[0] - 1.0) * 100
     return bankuai_name, data_test,bankuai_rank
 
-def get_bankuai_stock_data(stock_name, stock_code, stock_rank):
-    """获取个股分时数据，附带计算换手率"""
+def get_bankuai_stock_data(stock_name, stock_code, stock_rank, circ_shares):
+    """获取个股分时数据 + 换手率（接收预计算的流通股）"""
     tmp = get_minutely_data(stock_code, bankuai=False)
     if tmp is None:
-        logging.debug(f"股票 {stock_name}({stock_code}) 分时数据为空")
         return stock_name, pd.DataFrame(), stock_rank, None
-    
+
     data_test_ = data_to_data_frame(tmp)
-    if data_test_ is not None and not data_test_.empty:
-        data_test_ = (data_test_ / data_test_.iloc[0] - 1.0) * 100
-    else:
+    if data_test_ is None or data_test_.empty:
         return stock_name, pd.DataFrame(), stock_rank, None
-    
-    # 后台线程预计算换手率（失败不影响主数据）
+
+    data_test_ = (data_test_ / data_test_.iloc[0] - 1.0) * 100
+
+    # 使用预计算的流通股计算分时换手率
     turnover = None
-    if "Volume" in data_test_.columns:
+    if circ_shares > 0 and "Volume" in data_test_.columns:
         try:
-            import akshare as ak
-            info = ak.stock_individual_info_em(symbol=stock_code)
-            if len(info) > 7:
-                fluid_shares = info.iloc[7]["value"]
-                tmp_vol = data_test_["Volume"]
-                turnover = tmp_vol * 100 / fluid_shares * 100
-            else:
-                # 尝试其他行获取流通股
-                for idx, row in info.iterrows():
-                    if "流通股" in str(row.iloc[0]) or "流通" in str(row.iloc[0]):
-                        fluid_shares = row.iloc[1]
-                        tmp_vol = data_test_["Volume"]
-                        turnover = tmp_vol * 100 / fluid_shares * 100
-                        break
-        except Exception as e:
-            logging.debug(f"股票 {stock_name}({stock_code}) 换手率获取失败(不影响主图): {e}")
-    
+            tmp_vol = data_test_["Volume"]  # 单位: 手
+            turnover = tmp_vol * 100 / circ_shares * 100  # (手*100)股 / 流通股 * 100%
+        except Exception:
+            pass
     return stock_name, data_test_, stock_rank, turnover
 
-def _akshare_retry(func, *args, max_retries=3, **kwargs):
-    """akshare 调用重试包装，处理连接中断"""
+def _retry_http(func, *args, max_retries=3, **kwargs):
+    """HTTP调用重试包装"""
     for attempt in range(max_retries):
         try:
+            if attempt > 0:
+                delay = (2 ** attempt) + random.uniform(0.5, 1.5)
+                time.sleep(delay)
             return func(*args, **kwargs)
         except Exception as e:
             if attempt < max_retries - 1:
-                delay = (2 ** attempt) + random.uniform(0.5, 1.5)
-                logging.warning(f"[{func.__name__}] 重试 {attempt+1}/{max_retries}: {e}, 等待{delay:.1f}s")
-                time.sleep(delay)
+                logging.warning(f"[{func.__name__}] 失败 (尝试 {attempt+1}/{max_retries}): {e}")
             else:
                 logging.error(f"[{func.__name__}] 最终失败 (重试{max_retries}次): {e}")
                 raise
 
-
-def get_bankuai_dapan_minute_trend(show=False):
-    import time
+def get_bankuai_dapan_minute_trend():
+    """获取指数+板块分时数据 + 板块成分股快照（跳过个股分时以节省API额度）"""
     s = time.time()
-    shanghai_raw = get_minutely_data("0", bankuai=False, dapan=0)
-    sz_raw = get_minutely_data("0", bankuai=False, dapan=1)
-    chuangye_raw = get_minutely_data("0", bankuai=False, dapan=2)
 
-    shanghai_index_df = data_to_data_frame(shanghai_raw) if shanghai_raw else pd.DataFrame()
-    sz_index_df = data_to_data_frame(sz_raw) if sz_raw else pd.DataFrame()
-    chuangye_index_df = data_to_data_frame(chuangye_raw) if chuangye_raw else pd.DataFrame()
-
-    if not shanghai_index_df.empty:
-        shanghai_index_df = (shanghai_index_df / shanghai_index_df.iloc[0] - 1.0) * 100
-    if not sz_index_df.empty:
-        sz_index_df = (sz_index_df / sz_index_df.iloc[0] - 1.0) * 100
-    if not chuangye_index_df.empty:
-        chuangye_index_df = (chuangye_index_df / chuangye_index_df.iloc[0] - 1.0) * 100
-
-    stock_board_industry_name_em_df = _akshare_retry(ak.stock_board_industry_name_em)
-    stock_board_industry_name_em_df_5 = stock_board_industry_name_em_df.head(6)[["排名", "板块名称", "板块代码"]]
+    # ==== 阶段1: 先拉板块数据（push2域名，不受minute数据影响） ====
+    board_list = _http_board_list()
+    if not board_list:
+        logging.warning("[板块] HTTP获取板块列表为空")
+        import akshare as ak
+        try:
+            df_ak = ak.stock_board_industry_name_em()
+            board_list = []
+            for i, (_, row) in enumerate(df_ak.head(4).iterrows()):
+                board_list.append({
+                    "rank": row.get("排名", i + 1),
+                    "name": row.get("板块名称", ""),
+                    "code": row.get("板块代码", ""),
+                })
+        except Exception as e:
+            logging.error(f"[板块] akshare备用也失败: {e}")
 
     outer = OrderedDict()
     inner = {}
+    board_stock_snapshots = {}  # 额外存股票快照供渲染
+
+    if board_list:
+        top_boards = board_list[:4]
+        for bk in top_boards:
+            try:
+                stocks = _http_board_stocks(bk["code"])
+            except Exception:
+                stocks = []
+            time.sleep(0.8)
+            if stocks:
+                board_stock_snapshots[bk["name"]] = stocks[:5]  # 取前5只
+
+    # ==== 阶段2: 拉指数分时数据 ====
+    def _fetch_index(name, code, market):
+        raw = get_minutely_data(code, bankuai=False, dapan=market)
+        df = data_to_data_frame(raw) if raw else pd.DataFrame()
+        if not df.empty:
+            df = (df / df.iloc[0] - 1.0) * 100
+        return name, df
+
+    _, shanghai_index_df = _fetch_index("上证指数", "0", 0)
+    time.sleep(0.8)
+    _, sz_index_df = _fetch_index("深证指数", "0", 1)
+    time.sleep(0.8)
+    _, chuangye_index_df = _fetch_index("创业指数", "0", 2)
+    time.sleep(1.5)
+
     outer["上证指数"] = shanghai_index_df
     outer["深证指数"] = sz_index_df
     outer["创业指数"] = chuangye_index_df
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
-        for index, row in stock_board_industry_name_em_df_5.iterrows():
-            bankuai_rank = row["排名"]
-            bankuai_name = row["板块名称"]
-            bankuai_code = row["板块代码"]
-            futures.append(executor.submit(get_bankuai_data, bankuai_name, bankuai_code,bankuai_rank))
+    # ==== 阶段3: 拉板块分时数据（最多拉3个） ====
+    if board_list:
+        for bk in board_list[:3]:
+            _, bankuai_data, bankuai_rank = get_bankuai_data(bk["name"], bk["code"], bk["rank"])
+            outer[bk["name"]] = [bankuai_rank, bankuai_data]
+            time.sleep(1.0)
 
-        for future in concurrent.futures.as_completed(futures):
-            bankuai_name, bankuai_data,bankuai_rank = future.result()
-            outer[bankuai_name] = [bankuai_rank,bankuai_data]
+            # 个股分时只拉TOP 1
+            bk_stocks = board_stock_snapshots.get(bk["name"], [])
+            if bk_stocks:
+                top_stock = bk_stocks[0]
+                stock_data = get_bankuai_stock_data(
+                    top_stock["name"], top_stock["code"], top_stock["rank"], top_stock["circShares"]
+                )
+                stock_name, stock_df, stock_rank, stock_turnover = stock_data
+                if not stock_df.empty:
+                    inner[bk["name"]] = OrderedDict()
+                    inner[bk["name"]][stock_name] = [stock_rank, stock_df, "", stock_turnover]
 
-            # Fetch stocks for each bankuai
-            try:
-                stock_board_industry_cons_em_df = _akshare_retry(
-                    ak.stock_board_industry_cons_em, symbol=bankuai_name
-                ).head(8)
-            except Exception as e:
-                logging.warning(f"[板块成分股] {bankuai_name} 获取失败: {e}")
-                continue
-            inner[bankuai_name] = OrderedDict()
-            stock_futures = []
-            for index, row in stock_board_industry_cons_em_df.iterrows():
-                stock_rank = row["序号"]
-                stock_name = row["名称"]
-                stock_code = row["代码"]
-                stock_futures.append(executor.submit(get_bankuai_stock_data, stock_name, stock_code,stock_rank))
-
-            for stock_future in concurrent.futures.as_completed(stock_futures):
-                stock_name, stock_data, stock_rank, stock_turnover = stock_future.result()
-                inner[bankuai_name][stock_name] = [stock_rank, stock_data, stock_code, stock_turnover]
-    print(time.time() - s)
-    return outer, inner
+    print(f"分时图数据获取完成: {time.time() - s:.1f}s")
+    return outer, inner, board_stock_snapshots
 
 
 
@@ -516,27 +621,22 @@ class MatplotlibTab:
                             # （name,[rank,data]）
                             # item = list(item.items())
                             item = list(item)
-                            # stock_name = item[0]
                             stock_rank = item[0]
                             stock_data = item[1]
                             stock_code = item[2]
-                            # print(stock_data)
+                            stock_turnover = item[3] if len(item) > 3 else None
+
                             ax[1].plot(stock_data.index,
                                     stock_data.Close,
                                     label=f"{stock_rank}_{stock_name}",
                                     linewidth=1)
-                            
-                            #添加turnober
-                            
-                            tmp_vol = stock_data["Volume"]
-                            fluid_shares = ak.stock_individual_info_em(symbol=stock_code).iloc[7]["value"]
-                            fluid_shares = tmp_vol * 100 / fluid_shares * 100
-                            stock_data["Turnover"] = fluid_shares
-                           
-                            ax[2].plot(stock_data.index,
-                                    stock_data.Turnover,
-                                    label=f"{stock_rank}_{stock_name}",
-                                    linewidth=1)
+
+                            # 使用后台预计算的换手率，避免在GUI线程中重新调用API
+                            if stock_turnover is not None:
+                                ax[2].plot(stock_data.index,
+                                        stock_turnover,
+                                        label=f"{stock_rank}_{stock_name}",
+                                        linewidth=1)
                         ax[1].legend()
                         ax[1].grid()
                         ax[1].set_ylabel("个股票涨幅%")
